@@ -1,0 +1,553 @@
+name: Build MusicLock module
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.11.1
+      - name: Accept SDK licenses and install platform
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-36" "build-tools;36.0.0"
+      - name: Generate project files
+        run: |
+          mkdir -p MusicLock/app
+          cat > MusicLock/app/build.gradle.kts <<'EOF_0'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.musiclock"
+              compileSdk = 36
+              defaultConfig {
+                  applicationId = "com.musiclock"
+                  minSdk = 31
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_0
+          mkdir -p MusicLock/app/src/main
+          cat > MusicLock/app/src/main/AndroidManifest.xml <<'EOF_1'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+
+              <application android:label="MusicLock" android:allowBackup="false">
+                  <service
+                      android:name=".MediaListener"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+
+                  <activity
+                      android:name=".LockPlayerActivity"
+                      android:exported="false"
+                      android:launchMode="singleTask"
+                      android:excludeFromRecents="true"
+                      android:showWhenLocked="true"
+                      android:turnScreenOn="true"
+                      android:theme="@android:style/Theme.DeviceDefault.NoActionBar" />
+              </application>
+          </manifest>
+          EOF_1
+          mkdir -p MusicLock/app/src/main/java/com/musiclock
+          cat > MusicLock/app/src/main/java/com/musiclock/FadedImageView.kt <<'EOF_2'
+          package com.musiclock
+
+          import android.content.Context
+          import android.graphics.*
+          import android.widget.ImageView
+
+          /** 封面上下边缘渐隐，露出下层虚化背景 */
+          class FadedImageView(c: Context) : ImageView(c) {
+              private val p = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN) }
+
+              override fun draw(canvas: Canvas) {
+                  val w = width.toFloat(); val h = height.toFloat()
+                  val sc = canvas.saveLayer(0f, 0f, w, h, null)
+                  super.draw(canvas)
+                  p.shader = LinearGradient(
+                      0f, 0f, 0f, h,
+                      intArrayOf(0x00000000, 0xFF000000.toInt(), 0xFF000000.toInt(), 0x00000000),
+                      floatArrayOf(0f, 0.22f, 0.78f, 1f), Shader.TileMode.CLAMP
+                  )
+                  canvas.drawRect(0f, 0f, w, h, p)
+                  canvas.restoreToCount(sc)
+              }
+          }
+          EOF_2
+          mkdir -p MusicLock/app/src/main/java/com/musiclock
+          cat > MusicLock/app/src/main/java/com/musiclock/LockPlayerActivity.kt <<'EOF_3'
+          package com.musiclock
+
+          import android.app.Activity
+          import android.app.KeyguardManager
+          import android.content.*
+          import android.graphics.*
+          import android.media.MediaMetadata
+          import android.media.session.PlaybackState
+          import android.os.*
+          import android.view.*
+          import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+          import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+          import android.widget.*
+
+          class LockPlayerActivity : Activity() {
+              companion object { @Volatile var alive = false }
+
+              private val h = Handler(Looper.getMainLooper())
+              private lateinit var bg: ImageView
+              private lateinit var cover: FadedImageView
+              private lateinit var tvTitle: TextView
+              private lateinit var tvArtist: TextView
+              private lateinit var tvLyric: TextView
+              private lateinit var tvNext: TextView
+              private lateinit var bar: ProgressBar
+              private lateinit var btnPlay: TextView
+              private lateinit var gd: GestureDetector
+              private var lastKey = ""
+              private var curCover: Bitmap? = null
+              @Volatile private var lyrics: List<Pair<Long, String>> = emptyList()
+
+              private val unlockRx = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context, i: Intent) = finish()
+              }
+              private val tick = object : Runnable {
+                  override fun run() { update(); h.postDelayed(this, 250) }
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  alive = true
+                  setShowWhenLocked(true)
+                  setTurnScreenOn(true)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  window.setDecorFitsSystemWindows(false)
+                  window.statusBarColor = Color.TRANSPARENT
+                  window.navigationBarColor = Color.TRANSPARENT
+                  window.attributes = window.attributes.apply {
+                      layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                  }
+                  window.insetsController?.hide(WindowInsets.Type.systemBars())
+
+                  val W = resources.displayMetrics.widthPixels
+                  val H = resources.displayMetrics.heightPixels
+                  val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+
+                  // 底层：放大 + 高斯模糊
+                  bg = ImageView(this).apply {
+                      scaleType = ImageView.ScaleType.CENTER_CROP
+                      scaleX = 1.3f; scaleY = 1.3f
+                      setRenderEffect(RenderEffect.createBlurEffect(120f, 120f, Shader.TileMode.CLAMP))
+                      setColorFilter(0x66000000, PorterDuff.Mode.SRC_ATOP)
+                  }
+                  root.addView(bg, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+
+                  // 上层：清晰方形封面，上下渐隐
+                  cover = FadedImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+                  root.addView(cover, FrameLayout.LayoutParams(W, W).apply { topMargin = (H * 0.10).toInt() })
+
+                  // 底部信息 + 歌词 + 控制
+                  val panel = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(32), 0, dp(32), dp(56))
+                  }
+                  tvTitle = text(26f, Color.WHITE, true).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END }
+                  tvArtist = text(18f, 0xB3FFFFFF.toInt(), false).apply { maxLines = 1 }
+                  tvLyric = text(22f, Color.WHITE, true).apply { minLines = 2; maxLines = 2 }
+                  tvNext = text(16f, 0x80FFFFFF.toInt(), false).apply { maxLines = 1 }
+                  bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+                      max = 1000
+                      progressTintList = android.content.res.ColorStateList.valueOf(Color.WHITE)
+                      progressBackgroundTintList = android.content.res.ColorStateList.valueOf(0x40FFFFFF)
+                  }
+                  val ctrl = LinearLayout(this).apply { gravity = Gravity.CENTER }
+                  val prev = text(36f, Color.WHITE, false).apply { text = "⏮"; setPadding(dp(28), dp(8), dp(28), dp(8)) }
+                  btnPlay = text(44f, Color.WHITE, false).apply { text = "⏸"; setPadding(dp(28), dp(8), dp(28), dp(8)) }
+                  val next = text(36f, Color.WHITE, false).apply { text = "⏭"; setPadding(dp(28), dp(8), dp(28), dp(8)) }
+                  prev.setOnClickListener { MediaListener.controller?.transportControls?.skipToPrevious() }
+                  next.setOnClickListener { MediaListener.controller?.transportControls?.skipToNext() }
+                  btnPlay.setOnClickListener {
+                      val c = MediaListener.controller ?: return@setOnClickListener
+                      if (c.playbackState?.state == PlaybackState.STATE_PLAYING) c.transportControls.pause()
+                      else c.transportControls.play()
+                  }
+                  ctrl.addView(prev); ctrl.addView(btnPlay); ctrl.addView(next)
+
+                  panel.addView(tvTitle); panel.addView(tvArtist)
+                  panel.addView(tvLyric, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(20) })
+                  panel.addView(tvNext)
+                  panel.addView(bar, LinearLayout.LayoutParams(MATCH_PARENT, dp(4)).apply { topMargin = dp(20) })
+                  panel.addView(ctrl, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(8) })
+                  root.addView(panel, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.BOTTOM))
+                  setContentView(root)
+
+                  // 上滑解锁
+                  gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+                      override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+                          if (e1 != null && e1.y - e2.y > dp(120) && vy < -800) { dismiss(); return true }
+                          return false
+                      }
+                  })
+                  registerReceiver(unlockRx, IntentFilter(Intent.ACTION_USER_PRESENT), Context.RECEIVER_NOT_EXPORTED)
+              }
+
+              private fun text(sp: Float, color: Int, bold: Boolean) = TextView(this).apply {
+                  setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, sp)
+                  setTextColor(color)
+                  if (bold) typeface = Typeface.DEFAULT_BOLD
+                  setShadowLayer(8f, 0f, 2f, 0x66000000)
+              }
+
+              override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+                  gd.onTouchEvent(ev)
+                  return super.dispatchTouchEvent(ev)
+              }
+
+              private fun dismiss() {
+                  getSystemService(KeyguardManager::class.java).requestDismissKeyguard(this,
+                      object : KeyguardManager.KeyguardDismissCallback() {
+                          override fun onDismissSucceeded() { finish() }
+                      })
+              }
+
+              override fun onResume() { super.onResume(); h.post(tick) }
+              override fun onPause() { super.onPause(); h.removeCallbacks(tick) }
+              override fun onDestroy() {
+                  alive = false
+                  try { unregisterReceiver(unlockRx) } catch (_: Exception) {}
+                  super.onDestroy()
+              }
+
+              private fun update() {
+                  val c = MediaListener.controller ?: return
+                  val md = c.metadata
+                  val title = md?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: ""
+                  val artist = md?.getString(MediaMetadata.METADATA_KEY_ARTIST)
+                      ?: md?.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST) ?: ""
+                  val album = md?.getString(MediaMetadata.METADATA_KEY_ALBUM) ?: ""
+                  val dur = md?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
+
+                  val key = "$title|$artist"
+                  if (key != lastKey) {
+                      lastKey = key
+                      tvTitle.text = title; tvArtist.text = artist
+                      lyrics = emptyList()
+                      Thread {
+                          val l = LyricsRepo.fetch(applicationContext, title, artist, album, dur)
+                          runOnUiThread { if (key == lastKey) lyrics = l }
+                      }.start()
+                  }
+
+                  val bmp = md?.getBitmap(MediaMetadata.METADATA_KEY_ART)
+                      ?: md?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+                      ?: md?.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
+                      ?: MediaListener.notifCover
+                  if (bmp != null && bmp !== curCover) {
+                      curCover = bmp; cover.setImageBitmap(bmp); bg.setImageBitmap(bmp)
+                  }
+
+                  val st = c.playbackState
+                  var pos = st?.position ?: 0L
+                  val playing = st?.state == PlaybackState.STATE_PLAYING
+                  if (st != null && playing)
+                      pos += ((SystemClock.elapsedRealtime() - st.lastPositionUpdateTime) * st.playbackSpeed).toLong()
+                  if (dur > 0) bar.progress = (pos * 1000 / dur).toInt().coerceIn(0, 1000)
+                  btnPlay.text = if (playing) "⏸" else "▶"
+
+                  val ls = lyrics
+                  var idx = -1
+                  for (i in ls.indices) { if (ls[i].first <= pos + 300) idx = i else break }
+                  tvLyric.text = if (idx >= 0) ls[idx].second else ""
+                  tvNext.text = ls.getOrNull(idx + 1)?.second ?: ""
+              }
+          }
+          EOF_3
+          mkdir -p MusicLock/app/src/main/java/com/musiclock
+          cat > MusicLock/app/src/main/java/com/musiclock/LyricsRepo.kt <<'EOF_4'
+          package com.musiclock
+
+          import android.content.Context
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+
+          object LyricsRepo {
+              private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
+
+              private fun get(url: String, headers: Map<String, String> = emptyMap()): String? = try {
+                  val c = URL(url).openConnection() as HttpURLConnection
+                  c.connectTimeout = 6000; c.readTimeout = 8000
+                  c.setRequestProperty("User-Agent", "MusicLock/1.0")
+                  headers.forEach { (k, v) -> c.setRequestProperty(k, v) }
+                  if (c.responseCode == 200) c.inputStream.bufferedReader().readText() else null
+              } catch (e: Exception) { null }
+
+              /** 返回带时间轴的歌词 (毫秒, 文本)，先查 LRCLIB，再查网易云 */
+              fun fetch(ctx: Context, title: String, artist: String, album: String, durMs: Long): List<Pair<Long, String>> {
+                  if (title.isBlank()) return emptyList()
+                  val f = File(ctx.cacheDir, "lrc_${"$title|$artist".hashCode()}.lrc")
+                  if (f.exists()) return parse(f.readText())
+                  val raw = lrclib(title, artist, album, durMs) ?: netease(title, artist)
+                  if (raw != null) f.writeText(raw)
+                  return raw?.let { parse(it) } ?: emptyList()
+              }
+
+              private fun lrclib(t: String, a: String, al: String, durMs: Long): String? {
+                  get("https://lrclib.net/api/get?track_name=${enc(t)}&artist_name=${enc(a)}" +
+                      "&album_name=${enc(al)}&duration=${durMs / 1000}")?.let {
+                      val s = JSONObject(it).optString("syncedLyrics")
+                      if (s.isNotBlank() && s != "null") return s
+                  }
+                  get("https://lrclib.net/api/search?track_name=${enc(t)}&artist_name=${enc(a)}")?.let {
+                      val arr = JSONArray(it)
+                      for (i in 0 until arr.length()) {
+                          val s = arr.getJSONObject(i).optString("syncedLyrics")
+                          if (s.isNotBlank() && s != "null") return s
+                      }
+                  }
+                  return null
+              }
+
+              // 非官方接口，可能随时失效
+              private fun netease(t: String, a: String): String? {
+                  val h = mapOf("Referer" to "https://music.163.com")
+                  val sr = get("https://music.163.com/api/search/get?s=${enc("$t $a")}&type=1&limit=3", h) ?: return null
+                  val songs = JSONObject(sr).optJSONObject("result")?.optJSONArray("songs") ?: return null
+                  if (songs.length() == 0) return null
+                  val id = songs.getJSONObject(0).optLong("id")
+                  val lr = get("https://music.163.com/api/song/lyric?id=$id&lv=1", h) ?: return null
+                  val s = JSONObject(lr).optJSONObject("lrc")?.optString("lyric")
+                  return if (s.isNullOrBlank()) null else s
+              }
+
+              private val tag = Regex("""\[(\d+):(\d+)(?:[.:](\d+))?]""")
+
+              fun parse(lrc: String): List<Pair<Long, String>> {
+                  val out = ArrayList<Pair<Long, String>>()
+                  for (line in lrc.lines()) {
+                      val ms = tag.findAll(line).toList()
+                      if (ms.isEmpty()) continue
+                      val text = line.substring(ms.last().range.last + 1).trim()
+                      for (m in ms) {
+                          val min = m.groupValues[1].toLong()
+                          val sec = m.groupValues[2].toLong()
+                          val frac = m.groupValues[3]
+                          val msv = when (frac.length) { 0 -> 0L; 1 -> frac.toLong() * 100; 2 -> frac.toLong() * 10; else -> frac.take(3).toLong() }
+                          out.add((min * 60 + sec) * 1000 + msv to text)
+                      }
+                  }
+                  return out.sortedBy { it.first }
+              }
+          }
+          EOF_4
+          mkdir -p MusicLock/app/src/main/java/com/musiclock
+          cat > MusicLock/app/src/main/java/com/musiclock/MediaListener.kt <<'EOF_5'
+          package com.musiclock
+
+          import android.app.*
+          import android.content.*
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.drawable.BitmapDrawable
+          import android.graphics.drawable.Drawable
+          import android.media.session.MediaController
+          import android.media.session.MediaSessionManager
+          import android.media.session.PlaybackState
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.PowerManager
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+
+          class MediaListener : NotificationListenerService() {
+              companion object {
+                  @Volatile var controller: MediaController? = null
+                  @Volatile var notifCover: Bitmap? = null
+                  // 只处理这些播放器；想支持别的就在这里加包名
+                  val PACKAGES = setOf("com.apple.android.music")
+                  const val CH = "musiclock_fsi"
+              }
+
+              private val h = Handler(Looper.getMainLooper())
+              private var lastLaunch = 0L
+              private var registered = false
+
+              private val cb = object : MediaController.Callback() {
+                  override fun onPlaybackStateChanged(state: PlaybackState?) = maybeShow()
+              }
+              private val sessionsListener = MediaSessionManager.OnActiveSessionsChangedListener { refresh(it) }
+              private val screenRx = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context, i: Intent) = maybeShow()
+              }
+
+              override fun onListenerConnected() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel(CH, "MusicLock", NotificationManager.IMPORTANCE_HIGH))
+                  val msm = getSystemService(MediaSessionManager::class.java)
+                  val cn = ComponentName(this, MediaListener::class.java)
+                  msm.addOnActiveSessionsChangedListener(sessionsListener, cn)
+                  refresh(msm.getActiveSessions(cn))
+                  if (!registered) {
+                      registerReceiver(screenRx, IntentFilter(Intent.ACTION_SCREEN_ON), Context.RECEIVER_NOT_EXPORTED)
+                      registered = true
+                  }
+                  activeNotifications?.forEach { grabCover(it) }
+              }
+
+              override fun onListenerDisconnected() {
+                  if (registered) { unregisterReceiver(screenRx); registered = false }
+              }
+
+              override fun onNotificationPosted(sbn: StatusBarNotification) = grabCover(sbn)
+
+              private fun grabCover(sbn: StatusBarNotification) {
+                  if (sbn.packageName !in PACKAGES) return
+                  try {
+                      sbn.notification.getLargeIcon()?.loadDrawable(this)?.let { notifCover = toBitmap(it) }
+                  } catch (_: Exception) {}
+              }
+
+              private fun toBitmap(d: Drawable): Bitmap {
+                  if (d is BitmapDrawable && d.bitmap != null) return d.bitmap
+                  val w = d.intrinsicWidth.coerceAtLeast(1); val hh = d.intrinsicHeight.coerceAtLeast(1)
+                  val b = Bitmap.createBitmap(w, hh, Bitmap.Config.ARGB_8888)
+                  d.setBounds(0, 0, w, hh); d.draw(Canvas(b))
+                  return b
+              }
+
+              private fun refresh(list: List<MediaController>?) {
+                  val mine = list?.filter { it.packageName in PACKAGES } ?: emptyList()
+                  val pick = mine.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING } ?: mine.firstOrNull()
+                  if (pick?.sessionToken != controller?.sessionToken) {
+                      controller?.unregisterCallback(cb)
+                      controller = pick
+                      pick?.registerCallback(cb, h)
+                  }
+                  maybeShow()
+              }
+
+              private fun maybeShow() {
+                  val playing = controller?.playbackState?.state == PlaybackState.STATE_PLAYING
+                  if (!playing || LockPlayerActivity.alive) return
+                  val km = getSystemService(KeyguardManager::class.java)
+                  val pm = getSystemService(PowerManager::class.java)
+                  if (!pm.isInteractive || !km.isKeyguardLocked) return   // 熄屏时不唤醒；已解锁不打扰
+                  val now = System.currentTimeMillis()
+                  if (now - lastLaunch < 1500) return
+                  lastLaunch = now
+
+                  val pi = PendingIntent.getActivity(
+                      this, 0, Intent(this, LockPlayerActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  val n = Notification.Builder(this, CH)
+                      .setSmallIcon(android.R.drawable.ic_media_play)
+                      .setContentTitle("MusicLock")
+                      .setCategory(Notification.CATEGORY_ALARM)
+                      .setFullScreenIntent(pi, true)
+                      .build()
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.notify(7, n)
+                  h.postDelayed({ nm.cancel(7) }, 3000)
+              }
+          }
+          EOF_5
+          mkdir -p MusicLock
+          cat > MusicLock/build.gradle.kts <<'EOF_6'
+          plugins {
+              id("com.android.application") version "8.9.1" apply false
+              id("org.jetbrains.kotlin.android") version "2.1.0" apply false
+          }
+          EOF_6
+          mkdir -p MusicLock
+          cat > MusicLock/gradle.properties <<'EOF_7'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          EOF_7
+          mkdir -p MusicLock/module
+          cat > MusicLock/module/customize.sh <<'EOF_8'
+          #!/system/bin/sh
+          SKIPUNZIP=0
+          [ -f "$MODPATH/musiclock.apk" ] || abort "! 模块内缺少 musiclock.apk"
+          ui_print "- 安装 MusicLock App"
+          pm install -r "$MODPATH/musiclock.apk" >/dev/null 2>&1 \
+            && ui_print "- 安装成功" \
+            || ui_print "! 现在安装失败，重启后会由 service.sh 再试一次"
+          EOF_8
+          mkdir -p MusicLock/module
+          cat > MusicLock/module/module.prop <<'EOF_9'
+          id=musiclock
+          name=MusicLock 锁屏封面
+          version=v1.0
+          versionCode=1
+          author=you
+          description=Apple Music 播放时，锁屏显示 iPhone 风格虚化封面 + 滚动歌词（配套 App 自动安装并授权）
+          EOF_9
+          mkdir -p MusicLock/module
+          cat > MusicLock/module/service.sh <<'EOF_10'
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          PKG=com.musiclock
+          until [ "$(getprop sys.boot_completed)" = "1" ]; do sleep 3; done
+          sleep 10
+          pm path $PKG >/dev/null 2>&1 || pm install -r "$MODDIR/musiclock.apk"
+          pm grant $PKG android.permission.POST_NOTIFICATIONS 2>/dev/null
+          appops set $PKG USE_FULL_SCREEN_INTENT allow
+          appops set $PKG SYSTEM_ALERT_WINDOW allow
+          appops set $PKG RUN_IN_BACKGROUND allow
+          appops set $PKG RUN_ANY_IN_BACKGROUND allow
+          cmd notification allow_listener $PKG/com.musiclock.MediaListener
+          dumpsys deviceidle whitelist +$PKG >/dev/null 2>&1
+          EOF_10
+          mkdir -p MusicLock/module
+          cat > MusicLock/module/uninstall.sh <<'EOF_11'
+          #!/system/bin/sh
+          cmd notification disallow_listener com.musiclock/com.musiclock.MediaListener
+          pm uninstall com.musiclock
+          EOF_11
+          mkdir -p MusicLock
+          cat > MusicLock/settings.gradle.kts <<'EOF_12'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "MusicLock"
+          include(":app")
+          EOF_12
+      - name: Build APK
+        run: |
+          cd MusicLock
+          gradle assembleDebug --no-daemon
+      - name: Package module
+        run: |
+          cp MusicLock/app/build/outputs/apk/debug/app-debug.apk MusicLock/module/musiclock.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MusicLock-module
+          path: MusicLock/module/*
